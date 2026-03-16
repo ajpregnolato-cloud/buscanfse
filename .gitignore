@@ -1,0 +1,8 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+
+# Generated icon artifact (avoid binary file in PR)
+assets/*.ico
