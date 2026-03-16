@@ -91,33 +91,66 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
     if not cert_path.exists():
         return ("Não identificado", "Não identificado")
 
-    cmd = ["openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-nameopt", "RFC2253"]
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return ("Não identificado", "Não identificado")
+    def format_cnpj(value: str) -> str:
+        digits = "".join(ch for ch in (value or "") if ch.isdigit())
+        if len(digits) >= 14:
+            c = digits[-14:]
+            return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:14]}"
+        return "Não identificado"
 
-    subject = (result.stdout or "").strip()
-    if "subject=" in subject:
-        subject = subject.split("subject=", 1)[1].strip()
+    def run_openssl(args: list[str]) -> str:
+        try:
+            r = subprocess.run(args, check=True, capture_output=True, text=True)
+            return (r.stdout or "")
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return ""
+
+    subject_rfc2253 = run_openssl([
+        "openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-nameopt", "RFC2253"
+    ]).strip()
+    if "subject=" in subject_rfc2253:
+        subject_rfc2253 = subject_rfc2253.split("subject=", 1)[1].strip()
+
+    subject_default = run_openssl([
+        "openssl", "x509", "-in", str(cert_path), "-noout", "-subject"
+    ]).strip()
+
+    cert_text = run_openssl([
+        "openssl", "x509", "-in", str(cert_path), "-noout", "-text"
+    ])
+
+    subject_joined = f"{subject_rfc2253} | {subject_default}"
 
     social_name = "Não identificado"
     cnpj = "Não identificado"
 
-    cn_match = re.search(r"(?:^|,)CN=([^,]+)", subject)
-    o_match = re.search(r"(?:^|,)O=([^,]+)", subject)
-    serial_match = re.search(r"(?:^|,)serialNumber=([^,]+)", subject, flags=re.IGNORECASE)
-
+    # Razão Social preferindo O= e fallback para CN=
+    o_match = re.search(r"(?:^|,|/)\s*O\s*=\s*([^,\/\n]+)", subject_joined, flags=re.IGNORECASE)
+    cn_match = re.search(r"(?:^|,|/)\s*CN\s*=\s*([^,\/\n]+)", subject_joined, flags=re.IGNORECASE)
     if o_match:
         social_name = o_match.group(1).strip()
     elif cn_match:
         social_name = cn_match.group(1).strip()
 
-    cnpj_source = serial_match.group(1) if serial_match else subject
-    digits = "".join(ch for ch in cnpj_source if ch.isdigit())
-    if len(digits) >= 14:
-        cnpj_digits = digits[-14:]
-        cnpj = f"{cnpj_digits[:2]}.{cnpj_digits[2:5]}.{cnpj_digits[5:8]}/{cnpj_digits[8:12]}-{cnpj_digits[12:14]}"
+    # CNPJ em serialNumber do subject
+    serial_match = re.search(r"serialNumber\s*=\s*([^,\/\n]+)", subject_joined, flags=re.IGNORECASE)
+    if serial_match:
+        cnpj = format_cnpj(serial_match.group(1))
+
+    # CNPJ no OID ICP-Brasil 2.16.76.1.3.3 (Subject Alternative Name / otherName)
+    if cnpj == "Não identificado" and cert_text:
+        oid_lines = re.findall(r"2\.16\.76\.1\.3\.3[^\n]*", cert_text, flags=re.IGNORECASE)
+        for line in oid_lines:
+            candidate = format_cnpj(line)
+            if candidate != "Não identificado":
+                cnpj = candidate
+                break
+
+    # fallback: qualquer sequência de 14+ dígitos no subject/text
+    if cnpj == "Não identificado":
+        fallback_digits = re.search(r"\d{14,}", f"{subject_joined}\n{cert_text}")
+        if fallback_digits:
+            cnpj = format_cnpj(fallback_digits.group(0))
 
     return (social_name, cnpj)
 
