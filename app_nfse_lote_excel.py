@@ -91,12 +91,26 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
     if not cert_path.exists():
         return ("Não identificado", "Não identificado")
 
+    def only_digits(value: str) -> str:
+        return "".join(ch for ch in (value or "") if ch.isdigit())
+
     def format_cnpj(value: str) -> str:
-        digits = "".join(ch for ch in (value or "") if ch.isdigit())
+        digits = only_digits(value)
         if len(digits) >= 14:
             c = digits[-14:]
             return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:14]}"
         return "Não identificado"
+
+    def decode_possible_hex(value: str) -> str:
+        cleaned = value.strip().replace(":", "").replace(" ", "")
+        if len(cleaned) < 2 or len(cleaned) % 2 != 0:
+            return ""
+        if not re.fullmatch(r"[0-9A-Fa-f]+", cleaned):
+            return ""
+        try:
+            return bytes.fromhex(cleaned).decode("latin-1", errors="ignore")
+        except ValueError:
+            return ""
 
     def run_openssl(args: list[str]) -> str:
         try:
@@ -106,7 +120,7 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
             return ""
 
     subject_rfc2253 = run_openssl([
-        "openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-nameopt", "RFC2253"
+        "openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-nameopt", "RFC2253,utf8"
     ]).strip()
     if "subject=" in subject_rfc2253:
         subject_rfc2253 = subject_rfc2253.split("subject=", 1)[1].strip()
@@ -119,12 +133,13 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
         "openssl", "x509", "-in", str(cert_path), "-noout", "-text"
     ])
 
-    subject_joined = f"{subject_rfc2253} | {subject_default}"
+    subject_joined = f"{subject_rfc2253}\n{subject_default}"
+    haystack = f"{subject_joined}\n{cert_text}"
 
     social_name = "Não identificado"
     cnpj = "Não identificado"
 
-    # Razão Social preferindo O= e fallback para CN=
+    # Razão Social (prioriza O=, fallback CN=)
     o_match = re.search(r"(?:^|,|/)\s*O\s*=\s*([^,\/\n]+)", subject_joined, flags=re.IGNORECASE)
     cn_match = re.search(r"(?:^|,|/)\s*CN\s*=\s*([^,\/\n]+)", subject_joined, flags=re.IGNORECASE)
     if o_match:
@@ -132,25 +147,47 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
     elif cn_match:
         social_name = cn_match.group(1).strip()
 
-    # CNPJ em serialNumber do subject
+    # 1) serialNumber do subject
     serial_match = re.search(r"serialNumber\s*=\s*([^,\/\n]+)", subject_joined, flags=re.IGNORECASE)
     if serial_match:
         cnpj = format_cnpj(serial_match.group(1))
 
-    # CNPJ no OID ICP-Brasil 2.16.76.1.3.3 (Subject Alternative Name / otherName)
-    if cnpj == "Não identificado" and cert_text:
-        oid_lines = re.findall(r"2\.16\.76\.1\.3\.3[^\n]*", cert_text, flags=re.IGNORECASE)
-        for line in oid_lines:
-            candidate = format_cnpj(line)
+    # 2) OID ICP-Brasil do CNPJ: 2.16.76.1.3.3 em formatos variados
+    if cnpj == "Não identificado":
+        oid_patterns = [
+            r"(?:OID\.)?2\.16\.76\.1\.3\.3\s*[:=]\s*([^\n,]+)",
+            r"(?:OID\.)?2\.16\.76\.1\.3\.3\s*:\s*<[^>]+>\s*:?\s*([^\n,]+)",
+            r"othername\s*:?\s*(?:OID\.)?2\.16\.76\.1\.3\.3\s*[:=]\s*([^\n,]+)",
+            r"CNPJ\s*[:=]\s*([\d\.\-/]{14,})",
+        ]
+
+        candidates: list[str] = []
+        for pattern in oid_patterns:
+            candidates.extend(re.findall(pattern, haystack, flags=re.IGNORECASE))
+
+        for candidate in candidates:
+            candidate = re.sub(r"<(?:ASN1_)?(?:UTF8STRING|PRINTABLESTRING|IA5STRING|OCTET_STRING)>", "", candidate, flags=re.IGNORECASE)
+            candidate = candidate.strip()
+
+            direct = format_cnpj(candidate)
+            if direct != "Não identificado":
+                cnpj = direct
+                break
+
+            decoded = decode_possible_hex(candidate)
+            if decoded:
+                from_hex = format_cnpj(decoded)
+                if from_hex != "Não identificado":
+                    cnpj = from_hex
+                    break
+
+    # 3) fallback conservador: qualquer bloco com 14+ dígitos no texto completo
+    if cnpj == "Não identificado":
+        for chunk in re.findall(r"[\d\.\-/]{14,}", haystack):
+            candidate = format_cnpj(chunk)
             if candidate != "Não identificado":
                 cnpj = candidate
                 break
-
-    # fallback: qualquer sequência de 14+ dígitos no subject/text
-    if cnpj == "Não identificado":
-        fallback_digits = re.search(r"\d{14,}", f"{subject_joined}\n{cert_text}")
-        if fallback_digits:
-            cnpj = format_cnpj(fallback_digits.group(0))
 
     return (social_name, cnpj)
 
