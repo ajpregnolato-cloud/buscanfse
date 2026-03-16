@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -82,6 +83,43 @@ def dedup_keep_order(values: list[str]) -> list[str]:
             uniq.append(value)
             seen.add(value)
     return uniq
+
+
+
+
+def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
+    if not cert_path.exists():
+        return ("Não identificado", "Não identificado")
+
+    cmd = ["openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-nameopt", "RFC2253"]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return ("Não identificado", "Não identificado")
+
+    subject = (result.stdout or "").strip()
+    if "subject=" in subject:
+        subject = subject.split("subject=", 1)[1].strip()
+
+    social_name = "Não identificado"
+    cnpj = "Não identificado"
+
+    cn_match = re.search(r"(?:^|,)CN=([^,]+)", subject)
+    o_match = re.search(r"(?:^|,)O=([^,]+)", subject)
+    serial_match = re.search(r"(?:^|,)serialNumber=([^,]+)", subject, flags=re.IGNORECASE)
+
+    if o_match:
+        social_name = o_match.group(1).strip()
+    elif cn_match:
+        social_name = cn_match.group(1).strip()
+
+    cnpj_source = serial_match.group(1) if serial_match else subject
+    digits = "".join(ch for ch in cnpj_source if ch.isdigit())
+    if len(digits) >= 14:
+        cnpj_digits = digits[-14:]
+        cnpj = f"{cnpj_digits[:2]}.{cnpj_digits[2:5]}.{cnpj_digits[5:8]}/{cnpj_digits[8:12]}-{cnpj_digits[12:14]}"
+
+    return (social_name, cnpj)
 
 
 def send_email_smtp(
@@ -219,7 +257,11 @@ class App(ctk.CTk):
         self.cooldown_seconds = tk.IntVar(value=int(self.cfg.get("cooldown_seconds", 3)))
 
         self.excel_rows = []
+        self.cert_social_name = tk.StringVar(value="Não identificado")
+        self.cert_cnpj = tk.StringVar(value="Não identificado")
+
         self._build_ui()
+        self.refresh_certificate_identity()
 
     def load_config(self):
         p = Path(CONFIG_FILE)
@@ -327,6 +369,10 @@ class App(ctk.CTk):
         tab_lote = tabview.add("Lote")
         tab_cfg = tabview.add("Configuração")
 
+        ctk.CTkLabel(tab_lote, text="Busca NFSe - Grupo Supply Service", font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w", pady=(10, 2), padx=10)
+        ctk.CTkLabel(tab_lote, textvariable=self.cert_social_name, font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=10)
+        ctk.CTkLabel(tab_lote, textvariable=self.cert_cnpj, font=ctk.CTkFont(size=13)).pack(anchor="w", padx=10, pady=(0, 8))
+
         ctk.CTkLabel(tab_lote, text="Opção 1 — Colar chaves (1 por linha):", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(8, 6), padx=10)
         self.txt_keys = ctk.CTkTextbox(tab_lote, width=1080, height=180)
         self.txt_keys.pack(anchor="w", padx=10)
@@ -349,8 +395,10 @@ class App(ctk.CTk):
         self.pb.pack(anchor="w", padx=10)
         self.pb.set(0)
 
-        self.txt_log = ctk.CTkTextbox(tab_lote, width=1080, height=320)
+        self.txt_log = ctk.CTkTextbox(tab_lote, width=1080, height=280)
         self.txt_log.pack(anchor="w", padx=10, pady=(8, 8))
+
+        ctk.CTkLabel(tab_lote, text="Todos os Direitos Reservados - Versão 02/2026.", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(0, 6))
 
         self._build_config_tab(tab_cfg)
 
@@ -404,12 +452,14 @@ class App(ctk.CTk):
 
     def on_save_config(self):
         self.save_config()
+        self.refresh_certificate_identity()
         messagebox.showinfo("OK", f"Configuração salva em {Path(CONFIG_FILE).resolve()}")
 
     def pick_cert(self):
         p = filedialog.askopenfilename(title="Selecione client_cert.pem", filetypes=[("PEM", "*.pem"), ("Todos", "*.*")])
         if p:
             self.cert_pem.set(p)
+            self.refresh_certificate_identity()
 
     def pick_key(self):
         p = filedialog.askopenfilename(title="Selecione client_key.pem", filetypes=[("PEM", "*.pem"), ("Todos", "*.*")])
@@ -482,8 +532,15 @@ class App(ctk.CTk):
 
         self.cert_pem.set(str(cert_out))
         self.key_pem.set(str(key_out))
+        self.refresh_certificate_identity()
         self.save_config()
         messagebox.showinfo("Sucesso", f"Conversão concluída!\n\nCert: {cert_out}\nKey: {key_out}\n\nOs arquivos ativos foram atualizados.")
+
+    def refresh_certificate_identity(self):
+        cert_path = Path(self.cert_pem.get().strip().strip('"'))
+        razao, cnpj = extract_cert_identity(cert_path)
+        self.cert_social_name.set(f"Razão Social: {razao}")
+        self.cert_cnpj.set(f"CNPJ do Certificado: {cnpj}")
 
     def download_template(self):
         path = filedialog.asksaveasfilename(title="Salvar planilha modelo", defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
