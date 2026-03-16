@@ -1,0 +1,19 @@
+{
+  "cert_pem": "C:\\Users\\Antonio Supply\\Documents\\busca-nfse\\cert_out\\client_cert.pem",
+  "key_pem": "C:\\Users\\Antonio Supply\\Documents\\busca-nfse\\cert_out\\client_key.pem",
+  "save_dir": "C:\\Users\\Antonio Supply\\Documents\\busca-nfse\\downloads",
+  "smtp_host": "",
+  "smtp_port": 587,
+  "smtp_user": "",
+  "smtp_pass": "",
+  "from_email": "",
+  "default_to": "",
+  "default_subject": "NFSe - DANFSE (PDF)",
+  "default_body": "Segue em anexo o DANFSE (PDF).",
+  "send_email_each": false,
+  "pause_between_items": 0.5,
+  "reprocess_rounds": 3,
+  "cooldown_between_rounds": 10,
+  "cooldown_every_n": 5,
+  "cooldown_seconds": 3
+}
