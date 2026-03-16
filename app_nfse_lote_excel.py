@@ -2,9 +2,11 @@ import json
 import re
 import ssl
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -390,6 +392,10 @@ class App(ctk.CTk):
         self.cert_social_name = tk.StringVar(value="Não identificado")
         self.cert_cnpj = tk.StringVar(value="Não identificado")
 
+        self.worker_thread: threading.Thread | None = None
+        self.worker_queue: Queue = Queue()
+        self.is_running = False
+
         self._build_ui()
         self.refresh_certificate_identity()
 
@@ -432,6 +438,55 @@ class App(ctk.CTk):
         self.txt_log.insert("end", msg + "\n")
         self.txt_log.see("end")
         self.update_idletasks()
+
+    def _set_running(self, running: bool):
+        self.is_running = running
+        state = "disabled" if running else "normal"
+        for w in (self.btn_clear, self.btn_run_text, self.btn_template, self.btn_import_excel, self.btn_run_excel, self.chk_email):
+            w.configure(state=state)
+
+    def _queue_log(self, msg: str):
+        self.worker_queue.put(("log", msg))
+
+    def _queue_progress(self, ratio: float):
+        self.worker_queue.put(("progress", ratio))
+
+    def _queue_done(self, ok: int, falhas_finais: list[str], resultado_path: Path, falhas_path: Path | None):
+        self.worker_queue.put(("done", (ok, falhas_finais, resultado_path, falhas_path)))
+
+    def _queue_error(self, err: str):
+        self.worker_queue.put(("error", err))
+
+    def _pump_worker_queue(self):
+        try:
+            while True:
+                kind, payload = self.worker_queue.get_nowait()
+                if kind == "log":
+                    self.log(payload)
+                elif kind == "progress":
+                    ratio = max(0.0, min(1.0, float(payload)))
+                    self.pb.set(ratio)
+                    self.progress.set(ratio * 100.0)
+                elif kind == "error":
+                    self._set_running(False)
+                    messagebox.showerror("Erro", payload)
+                    return
+                elif kind == "done":
+                    self._set_running(False)
+                    ok, falhas_finais, resultado_path, falhas_path = payload
+                    if falhas_path:
+                        messagebox.showwarning(
+                            "Concluído (com falhas)",
+                            f"Lote finalizado.\n\nSucesso: {ok}\nFalhas finais: {len(falhas_finais)}\n\nRelatório: {resultado_path}\nFalhas: {falhas_path}",
+                        )
+                    else:
+                        messagebox.showinfo("Concluído", f"Lote finalizado com sucesso!\n\nSucesso: {ok}\n\nRelatório: {resultado_path}")
+                    return
+        except Empty:
+            pass
+
+        if self.is_running:
+            self.after(100, self._pump_worker_queue)
 
     def _cert_tuple(self):
         cert = Path(self.cert_pem.get().strip().strip('"'))
@@ -509,11 +564,16 @@ class App(ctk.CTk):
 
         rowbtn = ctk.CTkFrame(tab_lote, fg_color="transparent")
         rowbtn.pack(anchor="w", padx=10, pady=(8, 8))
-        ctk.CTkButton(rowbtn, text="Limpar", command=lambda: self.txt_keys.delete("1.0", "end"), width=120).pack(side="left")
-        ctk.CTkButton(rowbtn, text="Executar lote (texto)", command=self.run_from_text, width=170).pack(side="left", padx=8)
-        ctk.CTkButton(rowbtn, text="Baixar modelo Excel", command=self.download_template, width=170).pack(side="left", padx=8)
-        ctk.CTkButton(rowbtn, text="Importar Excel", command=self.import_excel, width=140).pack(side="left", padx=8)
-        ctk.CTkButton(rowbtn, text="Executar lote (Excel)", command=self.run_from_excel, width=170).pack(side="left", padx=8)
+        self.btn_clear = ctk.CTkButton(rowbtn, text="Limpar", command=lambda: self.txt_keys.delete("1.0", "end"), width=120)
+        self.btn_clear.pack(side="left")
+        self.btn_run_text = ctk.CTkButton(rowbtn, text="Executar lote (texto)", command=self.run_from_text, width=170)
+        self.btn_run_text.pack(side="left", padx=8)
+        self.btn_template = ctk.CTkButton(rowbtn, text="Baixar modelo Excel", command=self.download_template, width=170)
+        self.btn_template.pack(side="left", padx=8)
+        self.btn_import_excel = ctk.CTkButton(rowbtn, text="Importar Excel", command=self.import_excel, width=140)
+        self.btn_import_excel.pack(side="left", padx=8)
+        self.btn_run_excel = ctk.CTkButton(rowbtn, text="Executar lote (Excel)", command=self.run_from_excel, width=170)
+        self.btn_run_excel.pack(side="left", padx=8)
 
         self.lbl_excel = ctk.CTkLabel(tab_lote, text="Nenhum Excel importado.")
         self.lbl_excel.pack(anchor="w", padx=10, pady=(0, 8))
@@ -727,136 +787,203 @@ class App(ctk.CTk):
         self.run_batch_items(items)
 
     def run_batch_items(self, items: list[dict]):
+        if self.is_running:
+            messagebox.showwarning("Aguarde", "Já existe um lote em execução.")
+            return
+
         do_email = self.send_email_each.get()
         if do_email and not self.smtp_ready():
             messagebox.showerror("Erro", "Envio por e-mail marcado, mas SMTP/To padrão não está completo na Configuração.")
             return
 
-        total = len(items)
-        item_by_key = {item["chave"]: item for item in items}
-        ok = 0
-        falhas = []
-        resultados = []
+        cfg = {
+            "do_email": do_email,
+            "pause_between_items": float(self.pause_between_items.get()),
+            "reprocess_rounds": int(self.reprocess_rounds.get()),
+            "cooldown_between_rounds": int(self.cooldown_between_rounds.get()),
+            "cooldown_every_n": int(self.cooldown_every_n.get()),
+            "cooldown_seconds": int(self.cooldown_seconds.get()),
+            "smtp_host": self.smtp_host.get().strip(),
+            "smtp_port": safe_int(self.smtp_port.get(), 587),
+            "smtp_user": self.smtp_user.get().strip(),
+            "smtp_pass": self.smtp_pass.get(),
+            "from_email": self.from_email.get().strip() or self.smtp_user.get().strip(),
+            "default_to": self.default_to.get().strip(),
+            "default_subject": self.default_subject.get().strip(),
+            "default_body": self.body_txt.get("1.0", "end").strip(),
+            "cert_tuple": self._cert_tuple(),
+            "out_dir": self._out_dir(),
+        }
 
-        self.progress.set(0.0)
         self.pb.set(0)
-        self.log("=" * 110)
-        self.log(f"Iniciando lote: {total} item(ns) | Pausa={self.pause_between_items.get()}s | Reprocess={self.reprocess_rounds.get()} rodada(s)")
+        self.progress.set(0)
+        self._set_running(True)
+        self.worker_thread = threading.Thread(target=self._run_batch_worker, args=(items, cfg), daemon=True)
+        self.worker_thread.start()
+        self.after(100, self._pump_worker_queue)
 
-        for i, item in enumerate(items, start=1):
-            chave = item["chave"]
-            origem = item.get("origem", "")
+    def _run_batch_worker(self, items: list[dict], cfg: dict):
+        try:
+            do_email = cfg["do_email"]
+            total = len(items)
+            item_by_key = {item["chave"]: item for item in items}
+            ok = 0
+            falhas = []
+            resultados = []
 
-            self.log(f"[{i}/{total}] Processando chave: {chave}")
-            pdf, err = self.baixar_pdf(chave)
+            def baixar_pdf_worker(chave: str) -> tuple[Path | None, str]:
+                url = f"{DANFSE_PROD}/{chave}"
+                resp = get_with_retry(url, cfg["cert_tuple"], timeout=70, retries=4)
 
-            email_to = ""
-            if pdf:
-                ok += 1
-                if do_email:
-                    try:
-                        email_to = self.send_email_for_pdf(chave=chave, pdf=pdf, email=item.get("email", ""), assunto=item.get("assunto", ""), corpo=item.get("corpo", ""))
-                    except Exception as e:
-                        self.log(f"  [EMAIL] ERRO: {e}")
+                if isinstance(resp, Exception):
+                    return None, f"rede: {resp}"
 
-                resultados.append({"chave": chave, "status": "OK", "pdf_path": str(pdf), "email_to": email_to, "erro": "", "origem": origem})
+                if resp.status_code == 200 and is_pdf_response(resp):
+                    out = cfg["out_dir"] / f"DANFSE_{chave}.pdf"
+                    out.write_bytes(resp.content)
+                    return out, ""
+
+                ct = resp.headers.get("content-type", "")
+                err_txt = f"status={resp.status_code} ct={ct}"
+                try:
+                    snippet = resp.text[:200].replace("\n", " ").strip()
+                    if snippet:
+                        err_txt += f" resp={snippet}"
+                except Exception:
+                    pass
+                return None, err_txt
+
+            def send_email_worker(chave: str, pdf: Path, email: str = "", assunto: str = "", corpo: str = "") -> str:
+                to_e = (email or "").strip() or cfg["default_to"]
+                subject = (assunto or "").strip() or cfg["default_subject"]
+                body = (corpo or "").strip() or cfg["default_body"]
+                subject = f"{subject} | {chave}"
+                send_email_smtp(
+                    cfg["smtp_host"],
+                    cfg["smtp_port"],
+                    cfg["smtp_user"],
+                    cfg["smtp_pass"],
+                    cfg["from_email"],
+                    to_e,
+                    subject,
+                    body,
+                    pdf,
+                )
+                return to_e
+
+            self._queue_log("=" * 110)
+            self._queue_log(f"Iniciando lote: {total} item(ns) | Pausa={cfg['pause_between_items']}s | Reprocess={cfg['reprocess_rounds']} rodada(s)")
+
+            for i, item in enumerate(items, start=1):
+                chave = item["chave"]
+                origem = item.get("origem", "")
+
+                self._queue_log(f"[{i}/{total}] Processando chave: {chave}")
+                pdf, err = baixar_pdf_worker(chave)
+
+                email_to = ""
+                if pdf:
+                    ok += 1
+                    if do_email:
+                        try:
+                            email_to = send_email_worker(chave, pdf, item.get("email", ""), item.get("assunto", ""), item.get("corpo", ""))
+                        except Exception as e:
+                            self._queue_log(f"  [EMAIL] ERRO: {e}")
+
+                    resultados.append({"chave": chave, "status": "OK", "pdf_path": str(pdf), "email_to": email_to, "erro": "", "origem": origem})
+                else:
+                    falhas.append(chave)
+                    resultados.append({"chave": chave, "status": "FALHA", "pdf_path": "", "email_to": "", "erro": err, "origem": origem})
+                    self._queue_log(f"  FALHA → {err}")
+
+                time.sleep(cfg["pause_between_items"])
+                ratio = i / total if total else 1
+                self._queue_progress(ratio)
+
+                n = cfg["cooldown_every_n"]
+                if n > 0 and i % n == 0:
+                    time.sleep(cfg["cooldown_seconds"])
+
+            rounds = cfg["reprocess_rounds"]
+            if falhas and rounds > 0:
+                self._queue_log("-" * 110)
+                self._queue_log(f"Entrando em reprocessamento: {len(falhas)} falha(s)")
+
+                restantes = falhas[:]
+                for rodada in range(1, rounds + 1):
+                    if not restantes:
+                        break
+
+                    self._queue_log(f"=== Rodada {rodada}/{rounds} | Restantes: {len(restantes)} ===")
+                    time.sleep(cfg["cooldown_between_rounds"])
+
+                    novas_restantes = []
+                    for j, chave in enumerate(restantes, start=1):
+                        self._queue_log(f"[RETRY {rodada}] ({j}/{len(restantes)}) {chave}")
+                        pdf, err = baixar_pdf_worker(chave)
+
+                        if pdf:
+                            ok += 1
+                            for row in resultados:
+                                if row["chave"] == chave and row["status"] == "FALHA":
+                                    row["status"] = "RECUPERADO"
+                                    row["pdf_path"] = str(pdf)
+                                    row["erro"] = ""
+                                    break
+
+                            if do_email:
+                                try:
+                                    original = item_by_key.get(chave, {})
+                                    email_to = send_email_worker(
+                                        chave,
+                                        pdf,
+                                        original.get("email", ""),
+                                        original.get("assunto", ""),
+                                        original.get("corpo", ""),
+                                    )
+                                    for row in resultados:
+                                        if row["chave"] == chave and row["status"] == "RECUPERADO":
+                                            row["email_to"] = email_to
+                                            break
+                                except Exception as e:
+                                    self._queue_log(f"  [EMAIL] ERRO: {e}")
+
+                            self._queue_log("  RECUPERADO ✅")
+                        else:
+                            novas_restantes.append(chave)
+                            for row in resultados:
+                                if row["chave"] == chave and row["status"] == "FALHA":
+                                    row["erro"] = err
+                                    break
+                            self._queue_log(f"  AINDA FALHA → {err}")
+
+                        if cfg["cooldown_every_n"] > 0 and j % cfg["cooldown_every_n"] == 0:
+                            time.sleep(cfg["cooldown_seconds"])
+                        else:
+                            time.sleep(cfg["pause_between_items"])
+
+                    restantes = novas_restantes
+
+                falhas_finais = restantes[:]
             else:
-                falhas.append(chave)
-                resultados.append({"chave": chave, "status": "FALHA", "pdf_path": "", "email_to": "", "erro": err, "origem": origem})
-                self.log(f"  FALHA → {err}")
+                falhas_finais = falhas[:]
 
-            time.sleep(float(self.pause_between_items.get()))
-            ratio = i / total if total else 1
-            self.progress.set(ratio * 100.0)
-            self.pb.set(ratio)
+            resultado_path = salvar_resultado_xlsx(resultados, cfg["out_dir"])
+            self._queue_log("-" * 110)
+            self._queue_log(f"Relatório salvo: {resultado_path}")
 
-            n = int(self.cooldown_every_n.get())
-            if n > 0 and i % n == 0:
-                time.sleep(int(self.cooldown_seconds.get()))
+            falhas_path = None
+            if falhas_finais:
+                falhas_path = salvar_falhas_txt(falhas_finais, cfg["out_dir"])
+                self._queue_log(f"Falhas finais salvas: {falhas_path}")
 
-        rounds = int(self.reprocess_rounds.get())
-        if falhas and rounds > 0:
-            self.log("-" * 110)
-            self.log(f"Entrando em reprocessamento: {len(falhas)} falha(s)")
+            self._queue_log("-" * 110)
+            self._queue_log(f"Fim do lote. Sucesso total: {ok} | Falhas finais: {len(falhas_finais)}")
+            self._queue_done(ok, falhas_finais, resultado_path, falhas_path)
 
-            restantes = falhas[:]
-            for rodada in range(1, rounds + 1):
-                if not restantes:
-                    break
+        except Exception as e:
+            self._queue_error(f"Falha durante processamento do lote: {e}")
 
-                self.log(f"=== Rodada {rodada}/{rounds} | Restantes: {len(restantes)} ===")
-                time.sleep(int(self.cooldown_between_rounds.get()))
-
-                novas_restantes = []
-                for j, chave in enumerate(restantes, start=1):
-                    self.log(f"[RETRY {rodada}] ({j}/{len(restantes)}) {chave}")
-                    pdf, err = self.baixar_pdf(chave)
-
-                    if pdf:
-                        ok += 1
-                        for row in resultados:
-                            if row["chave"] == chave and row["status"] == "FALHA":
-                                row["status"] = "RECUPERADO"
-                                row["pdf_path"] = str(pdf)
-                                row["erro"] = ""
-                                break
-
-                        if do_email:
-                            try:
-                                original = item_by_key.get(chave, {})
-                                email_to = self.send_email_for_pdf(
-                                    chave=chave,
-                                    pdf=pdf,
-                                    email=original.get("email", ""),
-                                    assunto=original.get("assunto", ""),
-                                    corpo=original.get("corpo", ""),
-                                )
-                                for row in resultados:
-                                    if row["chave"] == chave and row["status"] == "RECUPERADO":
-                                        row["email_to"] = email_to
-                                        break
-                            except Exception as e:
-                                self.log(f"  [EMAIL] ERRO: {e}")
-
-                        self.log("  RECUPERADO ✅")
-                    else:
-                        novas_restantes.append(chave)
-                        for row in resultados:
-                            if row["chave"] == chave and row["status"] == "FALHA":
-                                row["erro"] = err
-                                break
-                        self.log(f"  AINDA FALHA → {err}")
-
-                    if int(self.cooldown_every_n.get()) > 0 and j % int(self.cooldown_every_n.get()) == 0:
-                        time.sleep(int(self.cooldown_seconds.get()))
-                    else:
-                        time.sleep(float(self.pause_between_items.get()))
-
-                restantes = novas_restantes
-
-            falhas_finais = restantes[:]
-        else:
-            falhas_finais = falhas[:]
-
-        out_dir = self._out_dir()
-        resultado_path = salvar_resultado_xlsx(resultados, out_dir)
-        self.log("-" * 110)
-        self.log(f"Relatório salvo: {resultado_path}")
-
-        falhas_path = None
-        if falhas_finais:
-            falhas_path = salvar_falhas_txt(falhas_finais, out_dir)
-            self.log(f"Falhas finais salvas: {falhas_path}")
-
-        self.log("-" * 110)
-        self.log(f"Fim do lote. Sucesso total: {ok} | Falhas finais: {len(falhas_finais)}")
-        if falhas_path:
-            messagebox.showwarning(
-                "Concluído (com falhas)",
-                f"Lote finalizado.\n\nSucesso: {ok}\nFalhas finais: {len(falhas_finais)}\n\nRelatório: {resultado_path}\nFalhas: {falhas_path}",
-            )
-        else:
-            messagebox.showinfo("Concluído", f"Lote finalizado com sucesso!\n\nSucesso: {ok}\n\nRelatório: {resultado_path}")
 
 
 if __name__ == "__main__":

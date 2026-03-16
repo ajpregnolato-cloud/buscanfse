@@ -23,3 +23,7 @@ dist\BuscaNFSe\BuscaNFSe.exe
 - `app_nfse_lote_excel.spec`: configuração do PyInstaller.
 - `scripts/generate_icon.py`: gera ícone `.ico` automaticamente em `assets/busca_nfse.ico` (arquivo gerado em build, não versionado).
 
+
+## Observações de desempenho (Windows Server)
+- O build está com `UPX` desativado no `.spec` para evitar lentidão/travamentos em alguns ambientes Windows Server/antivírus.
+- O processamento do lote foi movido para thread de background para manter a interface responsiva durante execução.
