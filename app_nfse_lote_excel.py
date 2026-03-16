@@ -1,5 +1,6 @@
 import json
 import re
+import ssl
 import subprocess
 import time
 from datetime import datetime
@@ -112,6 +113,53 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
         except ValueError:
             return ""
 
+    def from_ssl_builtin() -> tuple[str, str]:
+        """Fallback sem binário openssl externo (funciona bem no Windows)."""
+        try:
+            info = ssl._ssl._test_decode_cert(str(cert_path))
+        except Exception:
+            return ("Não identificado", "Não identificado")
+
+        social_name = "Não identificado"
+        cnpj = "Não identificado"
+
+        # subject vem como sequência de RDNs: ((('organizationName', '...'),), ...)
+        subject_pairs = []
+        for rdn in info.get("subject", ()):
+            for pair in rdn:
+                if len(pair) == 2:
+                    subject_pairs.append(pair)
+
+        def get_subject_value(*keys: str) -> str:
+            keys_l = {k.lower() for k in keys}
+            for k, v in subject_pairs:
+                if str(k).lower() in keys_l and str(v).strip():
+                    return str(v).strip()
+            return ""
+
+        org = get_subject_value("organizationName", "O")
+        cn = get_subject_value("commonName", "CN")
+        serial = get_subject_value("serialNumber")
+
+        if org:
+            social_name = org
+        elif cn:
+            social_name = cn
+
+        if serial:
+            cnpj = format_cnpj(serial)
+
+        # CN costuma trazer CNPJ no final em A1/A3 e-CNPJ
+        if cnpj == "Não identificado" and cn:
+            cnpj = format_cnpj(cn)
+
+        # fallback no subject completo serializado
+        if cnpj == "Não identificado":
+            packed = " | ".join(f"{k}={v}" for k, v in subject_pairs)
+            cnpj = format_cnpj(packed)
+
+        return (social_name, cnpj)
+
     def run_openssl(args: list[str]) -> str:
         try:
             r = subprocess.run(args, check=True, capture_output=True, text=True)
@@ -119,9 +167,14 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
         except (FileNotFoundError, subprocess.CalledProcessError):
             return ""
 
+    # Tenta primeiro via openssl externo (mais rico para OIDs), mas com fallback nativo
     subject_rfc2253 = run_openssl([
         "openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-nameopt", "RFC2253,utf8"
     ]).strip()
+
+    if not subject_rfc2253:
+        return from_ssl_builtin()
+
     if "subject=" in subject_rfc2253:
         subject_rfc2253 = subject_rfc2253.split("subject=", 1)[1].strip()
 
@@ -188,6 +241,13 @@ def extract_cert_identity(cert_path: Path) -> tuple[str, str]:
             if candidate != "Não identificado":
                 cnpj = candidate
                 break
+
+    if social_name == "Não identificado":
+        # fallback final pela API nativa do Python
+        fb_social, fb_cnpj = from_ssl_builtin()
+        social_name = fb_social
+        if cnpj == "Não identificado":
+            cnpj = fb_cnpj
 
     return (social_name, cnpj)
 
