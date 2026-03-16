@@ -1,24 +1,30 @@
 import json
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 
+import customtkinter as ctk
+import pandas as pd
 import requests
 import smtplib
 from email.message import EmailMessage
 from email.utils import formatdate
 
-from openpyxl import Workbook, load_workbook
+from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 
-# PRODUÇÃO (você validou)
 DANFSE_PROD = "https://adn.nfse.gov.br/danfse"
-
 APP_NAME = "NFS-e | DANFSE em Lote (Colar ou Excel)"
 CONFIG_FILE = "config.json"
+
+
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
 
 
 def normalize_key(s: str) -> str:
@@ -31,9 +37,6 @@ def is_pdf_response(resp: requests.Response) -> bool:
 
 
 def get_with_retry(url: str, cert_tuple, timeout: int, retries: int = 4):
-    """
-    GET com mTLS + retentativas para instabilidade 5xx/Cloudflare.
-    """
     last = None
     for attempt in range(1, retries + 1):
         try:
@@ -43,11 +46,10 @@ def get_with_retry(url: str, cert_tuple, timeout: int, retries: int = 4):
                 timeout=timeout,
                 headers={
                     "Accept": "application/pdf, application/json;q=0.9, */*;q=0.8",
-                    "User-Agent": "NfseClient/1.0 (Python requests)"
-                }
+                    "User-Agent": "NfseClient/1.0 (Python requests)",
+                },
             )
             last = r
-            # gateways instáveis
             if r.status_code in (502, 503, 504, 520, 521, 522):
                 time.sleep(1.5 * attempt)
                 continue
@@ -56,6 +58,30 @@ def get_with_retry(url: str, cert_tuple, timeout: int, retries: int = 4):
             last = e
             time.sleep(1.5 * attempt)
     return last
+
+
+def safe_int(value: Any, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def dedup_keep_order(values: list[str]) -> list[str]:
+    seen = set()
+    uniq = []
+    for value in values:
+        if value not in seen:
+            uniq.append(value)
+            seen.add(value)
+    return uniq
 
 
 def send_email_smtp(
@@ -67,7 +93,7 @@ def send_email_smtp(
     to_email: str,
     subject: str,
     body: str,
-    attachment_path: Path
+    attachment_path: Path,
 ):
     msg = EmailMessage()
     msg["From"] = from_email
@@ -87,66 +113,54 @@ def send_email_smtp(
         s.send_message(msg)
 
 
-def create_excel_template(path: Path):
-    wb = Workbook()
+def auto_fit_excel_columns(path: Path, widths: list[int]):
+    wb = load_workbook(path)
     ws = wb.active
-    ws.title = "DANFSE"
-
-    headers = ["CHAVE", "EMAIL", "ASSUNTO", "CORPO"]
-    ws.append(headers)
-    ws.append(["", "", "", ""])
-
-    widths = [48, 30, 40, 60]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
-
     ws.freeze_panes = "A2"
     wb.save(path)
 
 
+def create_excel_template(path: Path):
+    df = pd.DataFrame([{"CHAVE": "", "EMAIL": "", "ASSUNTO": "", "CORPO": ""}])
+    df.to_excel(path, index=False, sheet_name="DANFSE")
+    auto_fit_excel_columns(path, [48, 30, 40, 60])
+
+
 def read_excel_rows(path: Path):
-    """
-    Retorna lista de dicts:
-      {"chave":..., "email":..., "assunto":..., "corpo":...}
-    """
-    wb = load_workbook(path)
-    ws = wb.active
+    df = pd.read_excel(path, dtype=str).fillna("")
+    columns = {str(c).strip().upper(): c for c in df.columns}
 
-    header = []
-    for cell in ws[1]:
-        header.append((cell.value or "").strip().upper())
-    idx = {name: header.index(name) for name in header if name}
-
-    if "CHAVE" not in idx:
+    if "CHAVE" not in columns:
         raise RuntimeError("Planilha inválida: coluna CHAVE é obrigatória.")
 
+    def get_col(name: str) -> str:
+        return columns[name] if name in columns else ""
+
+    key_col = get_col("CHAVE")
+    email_col = get_col("EMAIL")
+    assunto_col = get_col("ASSUNTO")
+    corpo_col = get_col("CORPO")
+
     rows = []
-    for r in ws.iter_rows(min_row=2, values_only=True):
-        chave_raw = r[idx["CHAVE"]] if idx["CHAVE"] < len(r) else ""
-        chave = normalize_key(str(chave_raw or ""))
+    for _, row in df.iterrows():
+        chave = normalize_key(str(row.get(key_col, "")))
         if not chave:
             continue
 
-        email = ""
-        assunto = ""
-        corpo = ""
-        if "EMAIL" in idx and idx["EMAIL"] < len(r):
-            email = str(r[idx["EMAIL"]] or "").strip()
-        if "ASSUNTO" in idx and idx["ASSUNTO"] < len(r):
-            assunto = str(r[idx["ASSUNTO"]] or "").strip()
-        if "CORPO" in idx and idx["CORPO"] < len(r):
-            corpo = str(r[idx["CORPO"]] or "").strip()
+        rows.append(
+            {
+                "chave": chave,
+                "email": str(row.get(email_col, "")).strip() if email_col else "",
+                "assunto": str(row.get(assunto_col, "")).strip() if assunto_col else "",
+                "corpo": str(row.get(corpo_col, "")).strip() if corpo_col else "",
+            }
+        )
 
-        rows.append({"chave": chave, "email": email, "assunto": assunto, "corpo": corpo})
-
-    # remove duplicadas preservando ordem
-    seen = set()
-    uniq = []
-    for item in rows:
-        if item["chave"] not in seen:
-            uniq.append(item)
-            seen.add(item["chave"])
-    return uniq
+    uniq_keys = dedup_keep_order([item["chave"] for item in rows])
+    row_by_key = {item["chave"]: item for item in rows}
+    return [row_by_key[k] for k in uniq_keys]
 
 
 def now_stamp() -> str:
@@ -160,52 +174,32 @@ def salvar_falhas_txt(falhas: list[str], pasta: Path) -> Path:
 
 
 def salvar_resultado_xlsx(linhas: list[dict], pasta: Path) -> Path:
-    """
-    linhas: lista de dict:
-      chave, status, pdf_path, email_to, erro, origem
-    """
     p = pasta / f"resultado_{now_stamp()}.xlsx"
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "RESULTADO"
-
-    headers = ["CHAVE", "STATUS", "PDF_PATH", "EMAIL_TO", "ERRO", "ORIGEM"]
-    ws.append(headers)
-
-    for row in linhas:
-        ws.append([
-            row.get("chave", ""),
-            row.get("status", ""),
-            row.get("pdf_path", ""),
-            row.get("email_to", ""),
-            row.get("erro", ""),
-            row.get("origem", ""),
-        ])
-
-    widths = [48, 12, 60, 30, 60, 18]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    ws.freeze_panes = "A2"
-    wb.save(p)
+    cols = ["chave", "status", "pdf_path", "email_to", "erro", "origem"]
+    df = pd.DataFrame(linhas or [], columns=cols)
+    df.columns = ["CHAVE", "STATUS", "PDF_PATH", "EMAIL_TO", "ERRO", "ORIGEM"]
+    df.to_excel(p, index=False, sheet_name="RESULTADO")
+    auto_fit_excel_columns(p, [48, 12, 60, 30, 60, 18])
     return p
 
 
-class App(tk.Tk):
+class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1060x740")
+        self.geometry("1160x780")
         self.resizable(False, False)
 
         self.cfg = self.load_config()
 
-        # cert e saída
         self.cert_pem = tk.StringVar(value=self.cfg.get("cert_pem", str(Path.cwd() / "cert_out" / "client_cert.pem")))
         self.key_pem = tk.StringVar(value=self.cfg.get("key_pem", str(Path.cwd() / "cert_out" / "client_key.pem")))
+        self.pfx_file = tk.StringVar(value=self.cfg.get("pfx_file", ""))
+        self.pfx_password = tk.StringVar(value=self.cfg.get("pfx_password", ""))
+        self.pfx_output_dir = tk.StringVar(value=self.cfg.get("pfx_output_dir", str(Path.cwd() / "cert_out")))
+
         self.save_dir = tk.StringVar(value=self.cfg.get("save_dir", str(Path.cwd() / "downloads")))
 
-        # SMTP (opcional)
         self.smtp_host = tk.StringVar(value=self.cfg.get("smtp_host", ""))
         self.smtp_port = tk.StringVar(value=str(self.cfg.get("smtp_port", "587")))
         self.smtp_user = tk.StringVar(value=self.cfg.get("smtp_user", ""))
@@ -215,23 +209,18 @@ class App(tk.Tk):
         self.default_subject = tk.StringVar(value=self.cfg.get("default_subject", "NFSe - DANFSE (PDF)"))
         self.default_body = tk.StringVar(value=self.cfg.get("default_body", "Segue em anexo o DANFSE (PDF)."))
 
-        # execução
         self.send_email_each = tk.BooleanVar(value=bool(self.cfg.get("send_email_each", False)))
         self.progress = tk.DoubleVar(value=0.0)
 
-        # robustez lote
-        self.pause_between_items = tk.DoubleVar(value=float(self.cfg.get("pause_between_items", 0.5)))  # segundos
+        self.pause_between_items = tk.DoubleVar(value=float(self.cfg.get("pause_between_items", 0.5)))
         self.reprocess_rounds = tk.IntVar(value=int(self.cfg.get("reprocess_rounds", 3)))
-        self.cooldown_between_rounds = tk.IntVar(value=int(self.cfg.get("cooldown_between_rounds", 10)))  # segundos
+        self.cooldown_between_rounds = tk.IntVar(value=int(self.cfg.get("cooldown_between_rounds", 10)))
         self.cooldown_every_n = tk.IntVar(value=int(self.cfg.get("cooldown_every_n", 5)))
         self.cooldown_seconds = tk.IntVar(value=int(self.cfg.get("cooldown_seconds", 3)))
 
-        # dados carregados do Excel
         self.excel_rows = []
-
         self._build_ui()
 
-    # ---------- Config ----------
     def load_config(self):
         p = Path(CONFIG_FILE)
         if p.exists():
@@ -245,10 +234,12 @@ class App(tk.Tk):
         cfg = {
             "cert_pem": self.cert_pem.get().strip(),
             "key_pem": self.key_pem.get().strip(),
+            "pfx_file": self.pfx_file.get().strip(),
+            "pfx_password": self.pfx_password.get(),
+            "pfx_output_dir": self.pfx_output_dir.get().strip(),
             "save_dir": self.save_dir.get().strip(),
-
             "smtp_host": self.smtp_host.get().strip(),
-            "smtp_port": int(self.smtp_port.get().strip() or "587"),
+            "smtp_port": safe_int(self.smtp_port.get(), 587),
             "smtp_user": self.smtp_user.get().strip(),
             "smtp_pass": self.smtp_pass.get(),
             "from_email": self.from_email.get().strip(),
@@ -256,17 +247,15 @@ class App(tk.Tk):
             "default_subject": self.default_subject.get().strip(),
             "default_body": self.body_txt.get("1.0", "end").strip(),
             "send_email_each": bool(self.send_email_each.get()),
-
-            "pause_between_items": float(self.pause_between_items.get()),
-            "reprocess_rounds": int(self.reprocess_rounds.get()),
-            "cooldown_between_rounds": int(self.cooldown_between_rounds.get()),
-            "cooldown_every_n": int(self.cooldown_every_n.get()),
-            "cooldown_seconds": int(self.cooldown_seconds.get()),
+            "pause_between_items": safe_float(self.pause_between_items.get(), 0.5),
+            "reprocess_rounds": safe_int(self.reprocess_rounds.get(), 3),
+            "cooldown_between_rounds": safe_int(self.cooldown_between_rounds.get(), 10),
+            "cooldown_every_n": safe_int(self.cooldown_every_n.get(), 5),
+            "cooldown_seconds": safe_int(self.cooldown_seconds.get(), 3),
         }
         Path(CONFIG_FILE).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         self.cfg = cfg
 
-    # ---------- Helpers ----------
     def log(self, msg: str):
         self.txt_log.insert("end", msg + "\n")
         self.txt_log.see("end")
@@ -295,9 +284,6 @@ class App(tk.Tk):
         return bool(host and user and pw and to_e and from_e)
 
     def baixar_pdf(self, chave: str) -> tuple[Path | None, str]:
-        """
-        Retorna (pdf_path_ou_None, erro_string)
-        """
         url = f"{DANFSE_PROD}/{chave}"
         resp = get_with_retry(url, self._cert_tuple(), timeout=70, retries=4)
 
@@ -309,7 +295,6 @@ class App(tk.Tk):
             out.write_bytes(resp.content)
             return out, ""
 
-        # Captura detalhes
         ct = resp.headers.get("content-type", "")
         err_txt = f"status={resp.status_code} ct={ct}"
         try:
@@ -322,7 +307,7 @@ class App(tk.Tk):
 
     def send_email_for_pdf(self, chave: str, pdf: Path, email: str = "", assunto: str = "", corpo: str = ""):
         host = self.smtp_host.get().strip()
-        port = int(self.smtp_port.get().strip() or "587")
+        port = safe_int(self.smtp_port.get(), 587)
         user = self.smtp_user.get().strip()
         pw = self.smtp_pass.get()
         from_e = self.from_email.get().strip() or user
@@ -335,120 +320,88 @@ class App(tk.Tk):
         send_email_smtp(host, port, user, pw, from_e, to_e, subject, body, pdf)
         return to_e
 
-    # ---------- UI ----------
     def _build_ui(self):
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=10, pady=10)
+        tabview = ctk.CTkTabview(self, width=1120, height=740)
+        tabview.pack(fill="both", expand=True, padx=12, pady=12)
 
-        tab_lote = ttk.Frame(nb, padding=12)
-        tab_cfg = ttk.Frame(nb, padding=12)
+        tab_lote = tabview.add("Lote")
+        tab_cfg = tabview.add("Configuração")
 
-        nb.add(tab_lote, text="Lote (Colar ou Excel)")
-        nb.add(tab_cfg, text="Configuração")
+        ctk.CTkLabel(tab_lote, text="Opção 1 — Colar chaves (1 por linha):", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(8, 6), padx=10)
+        self.txt_keys = ctk.CTkTextbox(tab_lote, width=1080, height=180)
+        self.txt_keys.pack(anchor="w", padx=10)
 
-        # ----- TAB LOTE -----
-        ttk.Label(tab_lote, text="Opção 1 — Colar chaves (1 por linha):").grid(row=0, column=0, sticky="w")
-        self.txt_keys = tk.Text(tab_lote, width=120, height=10)
-        self.txt_keys.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 8))
+        rowbtn = ctk.CTkFrame(tab_lote, fg_color="transparent")
+        rowbtn.pack(anchor="w", padx=10, pady=(8, 8))
+        ctk.CTkButton(rowbtn, text="Limpar", command=lambda: self.txt_keys.delete("1.0", "end"), width=120).pack(side="left")
+        ctk.CTkButton(rowbtn, text="Executar lote (texto)", command=self.run_from_text, width=170).pack(side="left", padx=8)
+        ctk.CTkButton(rowbtn, text="Baixar modelo Excel", command=self.download_template, width=170).pack(side="left", padx=8)
+        ctk.CTkButton(rowbtn, text="Importar Excel", command=self.import_excel, width=140).pack(side="left", padx=8)
+        ctk.CTkButton(rowbtn, text="Executar lote (Excel)", command=self.run_from_excel, width=170).pack(side="left", padx=8)
 
-        rowbtn = ttk.Frame(tab_lote)
-        rowbtn.grid(row=2, column=0, columnspan=5, sticky="w")
-        ttk.Button(rowbtn, text="Limpar", command=lambda: self.txt_keys.delete("1.0", "end")).pack(side="left")
-        ttk.Button(rowbtn, text="Executar lote (do texto)", command=self.run_from_text).pack(side="left", padx=(8, 0))
+        self.lbl_excel = ctk.CTkLabel(tab_lote, text="Nenhum Excel importado.")
+        self.lbl_excel.pack(anchor="w", padx=10, pady=(0, 8))
 
-        ttk.Separator(tab_lote).grid(row=3, column=0, columnspan=5, sticky="we", pady=(12, 10))
+        self.chk_email = ctk.CTkCheckBox(tab_lote, text="Enviar e-mail automaticamente para cada PDF", variable=self.send_email_each)
+        self.chk_email.pack(anchor="w", padx=10, pady=(0, 8))
 
-        ttk.Label(tab_lote, text="Opção 2 — Excel (.xlsx):").grid(row=4, column=0, sticky="w")
+        self.pb = ctk.CTkProgressBar(tab_lote, width=1080)
+        self.pb.pack(anchor="w", padx=10)
+        self.pb.set(0)
 
-        rowbtn2 = ttk.Frame(tab_lote)
-        rowbtn2.grid(row=5, column=0, columnspan=5, sticky="w", pady=(6, 6))
-        ttk.Button(rowbtn2, text="Baixar planilha modelo", command=self.download_template).pack(side="left")
-        ttk.Button(rowbtn2, text="Importar Excel", command=self.import_excel).pack(side="left", padx=(8, 0))
-        ttk.Button(rowbtn2, text="Executar lote (do Excel importado)", command=self.run_from_excel).pack(side="left", padx=(8, 0))
+        self.txt_log = ctk.CTkTextbox(tab_lote, width=1080, height=320)
+        self.txt_log.pack(anchor="w", padx=10, pady=(8, 8))
 
-        self.lbl_excel = ttk.Label(tab_lote, text="Nenhum Excel importado.")
-        self.lbl_excel.grid(row=6, column=0, columnspan=5, sticky="w")
+        self._build_config_tab(tab_cfg)
 
-        ttk.Checkbutton(
-            tab_lote, text="Enviar e-mail para cada PDF baixado",
-            variable=self.send_email_each
-        ).grid(row=7, column=0, sticky="w", pady=(10, 0))
+    def _build_config_tab(self, tab_cfg):
+        container = ctk.CTkScrollableFrame(tab_cfg, width=1100, height=700)
+        container.pack(fill="both", expand=True, padx=10, pady=10)
 
-        ttk.Label(tab_lote, text="Progresso:").grid(row=8, column=0, sticky="w", pady=(12, 0))
-        self.pb = ttk.Progressbar(tab_lote, variable=self.progress, maximum=100.0, length=900)
-        self.pb.grid(row=9, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ctk.CTkLabel(container, text="Certificado mTLS", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(8, 6))
 
-        ttk.Separator(tab_lote).grid(row=10, column=0, columnspan=5, sticky="we", pady=(12, 10))
+        self._labeled_entry(container, "client_cert.pem", self.cert_pem, self.pick_cert)
+        self._labeled_entry(container, "client_key.pem", self.key_pem, self.pick_key)
+        self._labeled_entry(container, "Pasta para salvar PDFs", self.save_dir, self.pick_dir)
 
-        ttk.Label(tab_lote, text="Log:").grid(row=11, column=0, sticky="nw")
-        self.txt_log = tk.Text(tab_lote, width=120, height=18)
-        self.txt_log.grid(row=11, column=1, columnspan=4, sticky="w")
+        ctk.CTkLabel(container, text="Conversão PFX → PEM (troca de CNPJ)", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(16, 6))
+        self._labeled_entry(container, "Arquivo .pfx/.p12", self.pfx_file, self.pick_pfx)
+        self._labeled_entry(container, "Senha do PFX", self.pfx_password, None, show="*")
+        self._labeled_entry(container, "Pasta de saída dos PEM", self.pfx_output_dir, self.pick_pfx_out_dir)
 
-        # ----- TAB CONFIG -----
-        ttk.Label(tab_cfg, text="Certificado (mTLS):").grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(container, text="Converter PFX e substituir certificados ativos", command=self.convert_pfx_to_pem, width=360).pack(anchor="w", pady=(6, 8))
 
-        ttk.Label(tab_cfg, text="client_cert.pem:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        c1 = ttk.Frame(tab_cfg)
-        c1.grid(row=1, column=1, sticky="w", pady=(8, 0))
-        ttk.Entry(c1, textvariable=self.cert_pem, width=78).pack(side="left", padx=(0, 8))
-        ttk.Button(c1, text="Selecionar...", command=self.pick_cert).pack(side="left")
+        ctk.CTkLabel(container, text="Robustez do lote", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(8, 6))
+        self._labeled_entry(container, "Pausa entre itens (s)", self.pause_between_items)
+        self._labeled_entry(container, "Rodadas de reprocessamento", self.reprocess_rounds)
+        self._labeled_entry(container, "Cooldown entre rodadas (s)", self.cooldown_between_rounds)
+        self._labeled_entry(container, "Cooldown a cada N itens", self.cooldown_every_n)
+        self._labeled_entry(container, "Cooldown (s)", self.cooldown_seconds)
 
-        ttk.Label(tab_cfg, text="client_key.pem:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        c2 = ttk.Frame(tab_cfg)
-        c2.grid(row=2, column=1, sticky="w", pady=(8, 0))
-        ttk.Entry(c2, textvariable=self.key_pem, width=78).pack(side="left", padx=(0, 8))
-        ttk.Button(c2, text="Selecionar...", command=self.pick_key).pack(side="left")
+        ctk.CTkLabel(container, text="SMTP", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(16, 6))
+        self._labeled_entry(container, "SMTP Host", self.smtp_host)
+        self._labeled_entry(container, "SMTP Port", self.smtp_port)
+        self._labeled_entry(container, "SMTP User", self.smtp_user)
+        self._labeled_entry(container, "SMTP Pass", self.smtp_pass, None, show="*")
+        self._labeled_entry(container, "From", self.from_email)
+        self._labeled_entry(container, "To padrão", self.default_to)
+        self._labeled_entry(container, "Assunto padrão", self.default_subject)
 
-        ttk.Label(tab_cfg, text="Pasta para salvar PDFs:").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        c3 = ttk.Frame(tab_cfg)
-        c3.grid(row=3, column=1, sticky="w", pady=(8, 0))
-        ttk.Entry(c3, textvariable=self.save_dir, width=78).pack(side="left", padx=(0, 8))
-        ttk.Button(c3, text="Escolher...", command=self.pick_dir).pack(side="left")
-
-        ttk.Separator(tab_cfg).grid(row=4, column=0, columnspan=2, sticky="we", pady=(14, 10))
-
-        ttk.Label(tab_cfg, text="Robustez do lote (recomendado manter assim):").grid(row=5, column=0, sticky="w")
-
-        rb = ttk.Frame(tab_cfg)
-        rb.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        def add_row(r, label, var, width=12):
-            ttk.Label(rb, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            ttk.Entry(rb, textvariable=var, width=width).grid(row=r, column=1, sticky="w", padx=(8, 0), pady=3)
-
-        add_row(0, "Pausa entre itens (s):", self.pause_between_items)
-        add_row(1, "Rodadas de reprocessamento:", self.reprocess_rounds)
-        add_row(2, "Cooldown entre rodadas (s):", self.cooldown_between_rounds)
-        add_row(3, "Cooldown a cada N itens:", self.cooldown_every_n)
-        add_row(4, "Cooldown (s):", self.cooldown_seconds)
-
-        ttk.Separator(tab_cfg).grid(row=7, column=0, columnspan=2, sticky="we", pady=(14, 10))
-
-        ttk.Label(tab_cfg, text="SMTP (opcional — necessário se marcar envio automático):").grid(row=8, column=0, sticky="w")
-
-        grid = ttk.Frame(tab_cfg)
-        grid.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        def add_smtp(r, label, var, width=36, show=None):
-            ttk.Label(grid, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            ttk.Entry(grid, textvariable=var, width=width, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0), pady=3)
-
-        add_smtp(0, "SMTP Host:", self.smtp_host)
-        add_smtp(1, "SMTP Port:", self.smtp_port, width=10)
-        add_smtp(2, "SMTP User:", self.smtp_user)
-        add_smtp(3, "SMTP Pass:", self.smtp_pass, show="*")
-        add_smtp(4, "From:", self.from_email)
-        add_smtp(5, "To padrão:", self.default_to)
-        add_smtp(6, "Assunto padrão:", self.default_subject, width=60)
-
-        ttk.Label(grid, text="Corpo padrão:").grid(row=7, column=0, sticky="nw", pady=3)
-        self.body_txt = tk.Text(grid, width=62, height=5)
-        self.body_txt.grid(row=7, column=1, sticky="w", padx=(8, 0), pady=3)
+        ctk.CTkLabel(container, text="Corpo padrão").pack(anchor="w")
+        self.body_txt = ctk.CTkTextbox(container, width=900, height=120)
+        self.body_txt.pack(anchor="w", pady=(4, 8))
         self.body_txt.insert("1.0", self.default_body.get())
 
-        ttk.Button(tab_cfg, text="Salvar configuração", command=self.on_save_config).grid(row=10, column=0, sticky="w", pady=(12, 0))
+        ctk.CTkButton(container, text="Salvar configuração", command=self.on_save_config, width=220).pack(anchor="w", pady=(6, 20))
 
-    # ---------- Buttons ----------
+    def _labeled_entry(self, parent, label, var, picker=None, show=None):
+        ctk.CTkLabel(parent, text=label).pack(anchor="w", pady=(4, 2))
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(anchor="w", fill="x")
+        ctk.CTkEntry(row, textvariable=var, width=760, show=show).pack(side="left", padx=(0, 6))
+        if picker:
+            ctk.CTkButton(row, text="Selecionar...", width=120, command=picker).pack(side="left")
+
     def on_save_config(self):
         self.save_config()
         messagebox.showinfo("OK", f"Configuração salva em {Path(CONFIG_FILE).resolve()}")
@@ -468,12 +421,72 @@ class App(tk.Tk):
         if p:
             self.save_dir.set(p)
 
+    def pick_pfx(self):
+        p = filedialog.askopenfilename(title="Selecione arquivo PFX/P12", filetypes=[("Certificado", "*.pfx *.p12"), ("Todos", "*.*")])
+        if p:
+            self.pfx_file.set(p)
+
+    def pick_pfx_out_dir(self):
+        p = filedialog.askdirectory(title="Selecione a pasta para gerar client_cert.pem/client_key.pem")
+        if p:
+            self.pfx_output_dir.set(p)
+
+    def convert_pfx_to_pem(self):
+        pfx_path = Path(self.pfx_file.get().strip())
+        pfx_pass = self.pfx_password.get()
+        out_dir = Path(self.pfx_output_dir.get().strip() or Path.cwd() / "cert_out")
+
+        if not pfx_path.exists():
+            messagebox.showerror("Erro", "Arquivo PFX/P12 não encontrado.")
+            return
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cert_out = out_dir / "client_cert.pem"
+        key_out = out_dir / "client_key.pem"
+
+        cmd_cert = [
+            "openssl",
+            "pkcs12",
+            "-in",
+            str(pfx_path),
+            "-clcerts",
+            "-nokeys",
+            "-out",
+            str(cert_out),
+            "-passin",
+            f"pass:{pfx_pass}",
+        ]
+        cmd_key = [
+            "openssl",
+            "pkcs12",
+            "-in",
+            str(pfx_path),
+            "-nocerts",
+            "-nodes",
+            "-out",
+            str(key_out),
+            "-passin",
+            f"pass:{pfx_pass}",
+        ]
+
+        try:
+            subprocess.run(cmd_cert, check=True, capture_output=True, text=True)
+            subprocess.run(cmd_key, check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            messagebox.showerror("Erro", "OpenSSL não encontrado no sistema. Instale e tente novamente.")
+            return
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or e.stdout or "").strip()[:300]
+            messagebox.showerror("Erro", f"Falha ao converter PFX:\n{err}")
+            return
+
+        self.cert_pem.set(str(cert_out))
+        self.key_pem.set(str(key_out))
+        self.save_config()
+        messagebox.showinfo("Sucesso", f"Conversão concluída!\n\nCert: {cert_out}\nKey: {key_out}\n\nOs arquivos ativos foram atualizados.")
+
     def download_template(self):
-        path = filedialog.asksaveasfilename(
-            title="Salvar planilha modelo",
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")]
-        )
+        path = filedialog.asksaveasfilename(title="Salvar planilha modelo", defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
         p = Path(path)
@@ -481,18 +494,18 @@ class App(tk.Tk):
         messagebox.showinfo("OK", f"Planilha modelo salva em:\n{p}")
 
     def import_excel(self):
-        p = filedialog.askopenfilename(
-            title="Importar planilha Excel",
-            filetypes=[("Excel", "*.xlsx")]
-        )
+        p = filedialog.askopenfilename(title="Importar planilha Excel", filetypes=[("Excel", "*.xlsx")])
         if not p:
             return
-        rows = read_excel_rows(Path(p))
+        try:
+            rows = read_excel_rows(Path(p))
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao importar Excel:\n{e}")
+            return
         self.excel_rows = rows
-        self.lbl_excel.config(text=f"Excel importado: {Path(p).name} | Linhas válidas: {len(rows)}")
+        self.lbl_excel.configure(text=f"Excel importado: {Path(p).name} | Linhas válidas: {len(rows)}")
         messagebox.showinfo("OK", f"Importado com sucesso.\nLinhas válidas: {len(rows)}")
 
-    # ---------- Batch runners ----------
     def run_from_text(self):
         keys = []
         for line in self.txt_keys.get("1.0", "end").splitlines():
@@ -500,14 +513,7 @@ class App(tk.Tk):
             if k:
                 keys.append(k)
 
-        # dedup
-        seen = set()
-        uniq = []
-        for k in keys:
-            if k not in seen:
-                uniq.append(k)
-                seen.add(k)
-
+        uniq = dedup_keep_order(keys)
         if not uniq:
             messagebox.showerror("Erro", "Nenhuma chave válida no texto.")
             return
@@ -529,7 +535,7 @@ class App(tk.Tk):
                 "email": r.get("email", ""),
                 "assunto": r.get("assunto", ""),
                 "corpo": r.get("corpo", ""),
-                "origem": "excel"
+                "origem": "excel",
             })
         self.run_batch_items(items)
 
@@ -540,17 +546,16 @@ class App(tk.Tk):
             return
 
         total = len(items)
+        item_by_key = {item["chave"]: item for item in items}
         ok = 0
-        fail = 0
         falhas = []
-
-        resultados = []  # para resultado.xlsx
+        resultados = []
 
         self.progress.set(0.0)
+        self.pb.set(0)
         self.log("=" * 110)
         self.log(f"Iniciando lote: {total} item(ns) | Pausa={self.pause_between_items.get()}s | Reprocess={self.reprocess_rounds.get()} rodada(s)")
 
-        # --- 1ª passada ---
         for i, item in enumerate(items, start=1):
             chave = item["chave"]
             origem = item.get("origem", "")
@@ -563,48 +568,25 @@ class App(tk.Tk):
                 ok += 1
                 if do_email:
                     try:
-                        email_to = self.send_email_for_pdf(
-                            chave=chave,
-                            pdf=pdf,
-                            email=item.get("email", ""),
-                            assunto=item.get("assunto", ""),
-                            corpo=item.get("corpo", "")
-                        )
+                        email_to = self.send_email_for_pdf(chave=chave, pdf=pdf, email=item.get("email", ""), assunto=item.get("assunto", ""), corpo=item.get("corpo", ""))
                     except Exception as e:
-                        # se email falhar, não consideramos "falha de pdf"
                         self.log(f"  [EMAIL] ERRO: {e}")
 
-                resultados.append({
-                    "chave": chave,
-                    "status": "OK",
-                    "pdf_path": str(pdf),
-                    "email_to": email_to,
-                    "erro": "",
-                    "origem": origem
-                })
+                resultados.append({"chave": chave, "status": "OK", "pdf_path": str(pdf), "email_to": email_to, "erro": "", "origem": origem})
             else:
-                fail += 1
                 falhas.append(chave)
-                resultados.append({
-                    "chave": chave,
-                    "status": "FALHA",
-                    "pdf_path": "",
-                    "email_to": "",
-                    "erro": err,
-                    "origem": origem
-                })
+                resultados.append({"chave": chave, "status": "FALHA", "pdf_path": "", "email_to": "", "erro": err, "origem": origem})
                 self.log(f"  FALHA → {err}")
 
-            # pausa curta (evita rajada/502)
             time.sleep(float(self.pause_between_items.get()))
-            self.progress.set((i / total) * 100.0)
+            ratio = i / total if total else 1
+            self.progress.set(ratio * 100.0)
+            self.pb.set(ratio)
 
-            # cooldown a cada N itens
             n = int(self.cooldown_every_n.get())
             if n > 0 and i % n == 0:
                 time.sleep(int(self.cooldown_seconds.get()))
 
-        # --- Reprocessamento das falhas (fila) ---
         rounds = int(self.reprocess_rounds.get())
         if falhas and rounds > 0:
             self.log("-" * 110)
@@ -625,9 +607,6 @@ class App(tk.Tk):
 
                     if pdf:
                         ok += 1
-                        fail -= 1  # recuperou uma falha anterior
-
-                        # Atualiza linha correspondente em resultados (marca como RECUPERADO)
                         for row in resultados:
                             if row["chave"] == chave and row["status"] == "FALHA":
                                 row["status"] = "RECUPERADO"
@@ -637,16 +616,14 @@ class App(tk.Tk):
 
                         if do_email:
                             try:
-                                # tenta achar item original para email/assunto/corpo
-                                original = next((x for x in items if x["chave"] == chave), {})
+                                original = item_by_key.get(chave, {})
                                 email_to = self.send_email_for_pdf(
                                     chave=chave,
                                     pdf=pdf,
                                     email=original.get("email", ""),
                                     assunto=original.get("assunto", ""),
-                                    corpo=original.get("corpo", "")
+                                    corpo=original.get("corpo", ""),
                                 )
-                                # salva email_to no resultado
                                 for row in resultados:
                                     if row["chave"] == chave and row["status"] == "RECUPERADO":
                                         row["email_to"] = email_to
@@ -657,14 +634,12 @@ class App(tk.Tk):
                         self.log("  RECUPERADO ✅")
                     else:
                         novas_restantes.append(chave)
-                        # atualiza erro mais recente
                         for row in resultados:
                             if row["chave"] == chave and row["status"] == "FALHA":
                                 row["erro"] = err
                                 break
                         self.log(f"  AINDA FALHA → {err}")
 
-                    # cooldown leve para não “estressar” o serviço
                     if int(self.cooldown_every_n.get()) > 0 and j % int(self.cooldown_every_n.get()) == 0:
                         time.sleep(int(self.cooldown_seconds.get()))
                     else:
@@ -672,12 +647,10 @@ class App(tk.Tk):
 
                 restantes = novas_restantes
 
-            # salva falhas finais (se houver)
             falhas_finais = restantes[:]
         else:
             falhas_finais = falhas[:]
 
-        # --- Salvar relatórios ---
         out_dir = self._out_dir()
         resultado_path = salvar_resultado_xlsx(resultados, out_dir)
         self.log("-" * 110)
@@ -693,19 +666,16 @@ class App(tk.Tk):
         if falhas_path:
             messagebox.showwarning(
                 "Concluído (com falhas)",
-                f"Lote finalizado.\n\nSucesso: {ok}\nFalhas finais: {len(falhas_finais)}\n\n"
-                f"Relatório: {resultado_path}\nFalhas: {falhas_path}"
+                f"Lote finalizado.\n\nSucesso: {ok}\nFalhas finais: {len(falhas_finais)}\n\nRelatório: {resultado_path}\nFalhas: {falhas_path}",
             )
         else:
-            messagebox.showinfo(
-                "Concluído",
-                f"Lote finalizado com sucesso!\n\nSucesso: {ok}\n\nRelatório: {resultado_path}"
-            )
+            messagebox.showinfo("Concluído", f"Lote finalizado com sucesso!\n\nSucesso: {ok}\n\nRelatório: {resultado_path}")
 
 
 if __name__ == "__main__":
     try:
         from ctypes import windll
+
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
